@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_description">Required by Volume Controller to reliably monitor and enforce locked volume and brightness levels persistently in the background.</string>
+</resources>
