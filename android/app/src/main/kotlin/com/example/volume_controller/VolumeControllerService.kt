@@ -29,6 +29,8 @@ class VolumeControllerService : AccessibilityService() {
     private val CHANNEL_ID = "VolumeControllerChannel"
     private val NOTIFICATION_ID = 1
 
+    @Volatile private var isEnforcing = false
+
     private lateinit var audioManager: AudioManager
     private lateinit var settingsObserver: SettingsObserver
 
@@ -110,17 +112,17 @@ class VolumeControllerService : AccessibilityService() {
         val ringLocked = prefs.getBoolean("flutter.ring_lock_enabled", false)
         val btLocked = prefs.getBoolean("flutter.bt_lock_enabled", false)
 
-        val mediaIntent = Intent("ACTION_TOGGLE_MEDIA_LOCK")
+        val mediaIntent = Intent("ACTION_TOGGLE_MEDIA_LOCK").apply { `package` = packageName }
         val mediaPendingIntent = PendingIntent.getBroadcast(
             this, 0, mediaIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val ringIntent = Intent("ACTION_TOGGLE_RING_LOCK")
+        val ringIntent = Intent("ACTION_TOGGLE_RING_LOCK").apply { `package` = packageName }
         val ringPendingIntent = PendingIntent.getBroadcast(
             this, 1, ringIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         
-        val btIntent = Intent("ACTION_TOGGLE_BT_LOCK")
+        val btIntent = Intent("ACTION_TOGGLE_BT_LOCK").apply { `package` = packageName }
         val btPendingIntent = PendingIntent.getBroadcast(
             this, 2, btIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
@@ -206,27 +208,67 @@ class VolumeControllerService : AccessibilityService() {
         }
     }
 
-    private inner class SettingsObserver(handler: Handler) : ContentObserver(handler) {
+    private fun getMaxScreenBrightness(): Int {
+        try {
+            val systemRes = android.content.res.Resources.getSystem()
+            val maxId = systemRes.getIdentifier("config_screenBrightnessSettingMaximum", "integer", "android")
+            if (maxId != 0) {
+                return systemRes.getInteger(maxId)
+            }
+        } catch (e: Exception) { }
+        return 255
+    }
+
+    private fun getMinScreenBrightness(): Int {
+        try {
+            val systemRes = android.content.res.Resources.getSystem()
+            val minId = systemRes.getIdentifier("config_screenBrightnessSettingMinimum", "integer", "android")
+            if (minId != 0) {
+                return systemRes.getInteger(minId)
+            }
+        } catch (e: Exception) { }
+        return 0
+    }
+
+    private inner class SettingsObserver(private val observerHandler: Handler) : ContentObserver(observerHandler) {
         override fun onChange(selfChange: Boolean, uri: Uri?) {
             super.onChange(selfChange, uri)
-            checkAndEnforceLocks()
-            broadcastCurrentVolumes()
+            // Debounce: wait 150ms so the system has committed the new value before we read it
+            observerHandler.removeCallbacksAndMessages("enforce")
+            observerHandler.postAtTime({
+                checkAndEnforceLocks()
+                broadcastCurrentVolumes()
+            }, "enforce", android.os.SystemClock.uptimeMillis() + 150)
         }
     }
     
     private fun broadcastCurrentVolumes() {
+        val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
         val intent = Intent("com.example.volume_controller.VOLUME_UPDATE")
+        // Live volume levels as percentages
         intent.putExtra("music", (audioManager.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)) * 100)
         intent.putExtra("ring", (audioManager.getStreamVolume(AudioManager.STREAM_RING).toFloat() / audioManager.getStreamMaxVolume(AudioManager.STREAM_RING)) * 100)
         intent.putExtra("alarm", (audioManager.getStreamVolume(AudioManager.STREAM_ALARM).toFloat() / audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM)) * 100)
         intent.putExtra("notification", (audioManager.getStreamVolume(AudioManager.STREAM_NOTIFICATION).toFloat() / audioManager.getStreamMaxVolume(AudioManager.STREAM_NOTIFICATION)) * 100)
         try {
-            intent.putExtra("brightness", (Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS).toFloat() / 255f) * 100)
+            val curB = Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS)
+            val minB = getMinScreenBrightness()
+            val maxB = getMaxScreenBrightness()
+            // Map the current system absolute value to a 0-100 percentage
+            val pct = ((curB - minB).toFloat() / (maxB - minB).toFloat()) * 100f
+            intent.putExtra("brightness", pct)
         } catch (e: Exception) {}
+        // Lock states (so notification button toggles sync back to Flutter UI)
+        intent.putExtra("media_locked", prefs.getBoolean("flutter.media_lock_enabled", false))
+        intent.putExtra("ring_locked", prefs.getBoolean("flutter.ring_lock_enabled", false))
+        intent.putExtra("bt_locked", prefs.getBoolean("flutter.bt_lock_enabled", false))
         sendBroadcast(intent)
     }
 
     private fun checkAndEnforceLocks() {
+        if (isEnforcing) return
+        isEnforcing = true
+        try {
         val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
 
         fun checkStream(stream: Int, enabledKey: String, minKey: String, maxKey: String) {
@@ -256,21 +298,36 @@ class VolumeControllerService : AccessibilityService() {
 
         // Brightness Lock
         if (prefs.getBoolean("flutter.brightness_min_lock_enabled", false)) {
-            val lockedPercentageMin = prefs.getLong("flutter.brightness_min_value", -1L).toInt()
-            val lockedPercentageMax = prefs.getLong("flutter.brightness_max_value", -1L).toInt()
-            if (lockedPercentageMin != -1 && Settings.System.canWrite(this)) {
+            val minPct = prefs.getLong("flutter.brightness_min_value", -1L).toInt()
+            val maxPct = prefs.getLong("flutter.brightness_max_value", -1L).toInt()
+            if (minPct != -1 && maxPct != -1 && Settings.System.canWrite(this)) {
                 try {
-                    val minValue = (lockedPercentageMin * 255) / 100
-                    val maxValue = (lockedPercentageMax * 255) / 100
-                    val currentBrightness = Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS)
-                    
-                    if (currentBrightness < minValue) {
-                        Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, minValue)
-                    } else if (currentBrightness > maxValue && maxValue > minValue) {
-                        Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, maxValue)
+                    // Only write manual mode if not already set, to avoid extra ContentObserver triggers
+                    val currentMode = Settings.System.getInt(contentResolver,
+                        Settings.System.SCREEN_BRIGHTNESS_MODE,
+                        Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC)
+                    if (currentMode != Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL) {
+                        Settings.System.putInt(contentResolver,
+                            Settings.System.SCREEN_BRIGHTNESS_MODE,
+                            Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
                     }
-                } catch (e: Exception) {}
+                    val sysMin = getMinScreenBrightness()
+                    val sysMax = getMaxScreenBrightness()
+                    val range = sysMax - sysMin
+
+                    val minVal = sysMin + ((minPct * range) / 100)
+                    val maxVal = sysMin + ((maxPct * range) / 100)
+                    val cur = Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, sysMax / 2)
+                    if (cur < minVal) {
+                        Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, minVal)
+                    } else if (cur > maxVal) {
+                        Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, maxVal)
+                    }
+                } catch (e: Exception) { Log.e("VolumeController", "Brightness error", e) }
             }
+        }
+        } finally {
+            isEnforcing = false
         }
     }
 }
